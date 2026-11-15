@@ -54,7 +54,9 @@ impl zed::Extension for ParquetViewerExtension {
 
         Ok(Command {
             command: zed::node_binary_path()?,
-            args: vec![self.server_path()?],
+            // CSV/TSV/JSONL rows are held in memory (as Zed's own CSV preview does), and V8's
+            // default heap cap is far below what a large file needs.
+            args: vec!["--max-old-space-size=8192".to_string(), self.server_path()?],
             env,
         })
     }

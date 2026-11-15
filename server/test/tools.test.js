@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, truncate, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, describe, it } from 'node:test'
 import { parquetWriteFile } from 'hyparquet-writer'
+import { MAX_TEXT_FILE_BYTES } from '../src/tables.js'
 import { convert, describeTable, query, readRows } from '../src/tools.js'
 
 /** @type {string} */
@@ -243,5 +244,45 @@ describe('regressions', () => {
       convert({ path: 'trips.parquet', format: 'csv', out: 'dirlink/trips.parquet', overwrite: true }, options),
       /must differ/,
     )
+  })
+
+  it('parses files larger than one stream chunk without splitting rows or characters', async () => {
+    // Several 64 KiB stream chunks, with multi-byte characters and quoted newlines landing on
+    // chunk boundaries somewhere in the file.
+    const count = 5000
+    const csvRows = Array.from({ length: count }, (_, i) => `${i},"naïve ☃ ${i}\nsecond line",${i % 2 ? 'true' : 'false'}`)
+    await writeFile(join(dir, 'chunked.csv'), `id,note,flag\n${csvRows.join('\n')}\n`)
+    const jsonRows = Array.from({ length: count }, (_, i) => JSON.stringify({ id: i, note: `ünïcødé ${i}` }))
+    await writeFile(join(dir, 'chunked.jsonl'), `${jsonRows.join('\n')}\n`)
+
+    const csv = await describeTable({ path: 'chunked.csv' }, options)
+    assert.match(csv, new RegExp(`Rows: ${count.toLocaleString('en-US')}`))
+    assert.match(csv, /\| id \| integer \|/)
+    assert.match(csv, /\| flag \| boolean \|/)
+    const lastCsv = await readRows({ path: 'chunked.csv', offset: count - 1, limit: 1 }, options)
+    assert.match(lastCsv, new RegExp(`\\| ${count - 1} \\| naïve ☃ ${count - 1} second line \\| true \\|`))
+
+    assert.match(await describeTable({ path: 'chunked.jsonl' }, options), new RegExp(`Rows: ${count.toLocaleString('en-US')}`))
+    const lastJson = await readRows({ path: 'chunked.jsonl', offset: count - 1, limit: 1 }, options)
+    assert.match(lastJson, new RegExp(`\\| ${count - 1} \\| ünïcødé ${count - 1} \\|`))
+  })
+
+  it('reports the line number of invalid JSONL', async () => {
+    await writeFile(join(dir, 'broken.jsonl'), '{"a":1}\n\n{"a":\n')
+    await assert.rejects(readRows({ path: 'broken.jsonl' }, options), /Invalid JSON on line 3 of/)
+  })
+
+  it('refuses text files too large to hold in memory before reading them', async () => {
+    // Sparse file: the size check happens before any bytes are read, so this is instant.
+    await writeFile(join(dir, 'huge.csv'), 'a,b\n')
+    await truncate(join(dir, 'huge.csv'), MAX_TEXT_FILE_BYTES + 1)
+    await assert.rejects(describeTable({ path: 'huge.csv' }, options), /over 1 GiB aren't supported.*Convert the file to Parquet/)
+  })
+
+  it('rejects unreadable text files instead of crashing', async () => {
+    for (const name of ['folder.csv', 'folder.jsonl']) {
+      await mkdir(join(dir, name))
+      await assert.rejects(describeTable({ path: name }, options), /Could not parse .*EISDIR/, name)
+    }
   })
 })

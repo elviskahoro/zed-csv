@@ -1,6 +1,9 @@
-import { readFile, stat } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
+import { stat } from 'node:fs/promises'
 import { extname } from 'node:path'
-import { parse } from 'csv-parse/sync'
+import { createInterface } from 'node:readline'
+import { pipeline } from 'node:stream'
+import { parse } from 'csv-parse'
 import { asyncBufferFromFile, parquetMetadataAsync, parquetReadObjects, parquetSchema } from 'hyparquet'
 import { compressors } from 'hyparquet-compressors'
 import { asyncRow } from 'squirreling'
@@ -41,6 +44,13 @@ const FORMATS = {
 export const SUPPORTED_EXTENSIONS = Object.keys(FORMATS)
 
 /**
+ * Text formats are held fully in memory. A 600 MiB CSV parsed and then queried with GROUP BY
+ * fits in a heap capped at 5.3x its size, so a 1 GiB file needs about 5.3 GiB of the 8 GiB
+ * heap the extension gives Node, leaving headroom for denser data.
+ */
+export const MAX_TEXT_FILE_BYTES = 2 ** 30
+
+/**
  * @param {string} path
  * @returns {Format}
  */
@@ -68,6 +78,11 @@ export async function openTable(path) {
     throw error
   }
   if (format === 'parquet') return openParquet(path, fileSize)
+  if (fileSize > MAX_TEXT_FILE_BYTES) {
+    throw new Error(
+      `${path} is ${(fileSize / 2 ** 30).toFixed(1)} GiB; ${format.toUpperCase()} files over ${MAX_TEXT_FILE_BYTES / 2 ** 30} GiB aren't supported because they are loaded fully into memory. Convert the file to Parquet, which is read in row groups.`,
+    )
+  }
   return openText(path, fileSize, format)
 }
 
@@ -183,22 +198,30 @@ function chunkedDataSource(columns, numRows, chunks, readRows) {
 const BOOLEAN = /^(?:true|false)$/i
 
 /**
- * Picks one cast per column so a column never mixes numbers and strings.
- *
- * @param {string[]} values
- * @returns {(value: string) => string | number | boolean | null}
+ * Decides one cast per column so a column never mixes numbers and strings. Values are
+ * observed one at a time while parsing, so no per-column copy of the data is needed.
  */
-function columnCaster(values) {
-  const present = values.filter(value => value !== '')
-  // Only cast when the number prints back to the exact same text, so codes like "007",
-  // "1.50", or IDs beyond 2^53 keep their original form.
-  if (present.length && present.every(value => String(Number(value)) === value)) {
-    return value => (value === '' ? null : Number(value))
+class ColumnTypeTracker {
+  present = false
+  allNumbers = true
+  allBooleans = true
+
+  /** @param {string} value */
+  observe(value) {
+    if (value === '') return
+    this.present = true
+    // Only cast when the number prints back to the exact same text, so codes like "007",
+    // "1.50", or IDs beyond 2^53 keep their original form.
+    if (this.allNumbers && String(Number(value)) !== value) this.allNumbers = false
+    if (this.allBooleans && !BOOLEAN.test(value)) this.allBooleans = false
   }
-  if (present.length && present.every(value => BOOLEAN.test(value))) {
-    return value => (value === '' ? null : value.toLowerCase() === 'true')
+
+  /** @returns {(value: string) => string | number | boolean | null} */
+  caster() {
+    if (this.present && this.allNumbers) return value => (value === '' ? null : Number(value))
+    if (this.present && this.allBooleans) return value => (value === '' ? null : value.toLowerCase() === 'true')
+    return value => (value === '' ? null : value)
   }
-  return value => (value === '' ? null : value)
 }
 
 /**
@@ -208,8 +231,11 @@ function columnCaster(values) {
  * @returns {Promise<Table>}
  */
 async function openText(path, fileSize, format) {
-  const text = await readFile(path, 'utf8')
-  const { columns, rows } = format === 'jsonl' ? parseJsonLines(text, path) : parseDelimited(text, format === 'tsv' ? '\t' : ',', path)
+  // Parsed from a stream rather than one string: Node strings max out at 512 MiB, which made
+  // larger files fail outright. Rows still live in memory, like Zed's own CSV preview.
+  const { columns, rows } = format === 'jsonl'
+    ? await parseJsonLines(path)
+    : await parseDelimited(path, format === 'tsv' ? '\t' : ',')
   const numRows = rows.length
 
   /** @type {Table['readRows']} */
@@ -240,55 +266,95 @@ async function openText(path, fileSize, format) {
 }
 
 /**
- * @param {string} text
- * @param {string} delimiter
  * @param {string} path
+ * @param {string} delimiter
  */
-function parseDelimited(text, delimiter, path) {
+async function parseDelimited(path, delimiter) {
   /** @type {string[][]} */
-  let records
+  const records = []
+  /** @type {string[] | undefined} */
+  let header
+  /** @type {ColumnTypeTracker[]} */
+  let trackers = []
+  const parser = parse({
+    delimiter,
+    bom: true,
+    relax_column_count: true,
+    relax_quotes: true,
+    skip_empty_lines: true,
+    // TSV has no quoting convention; a literal " is just text.
+    quote: delimiter === '\t' ? false : '"',
+  })
   try {
-    records = parse(text, {
-      delimiter,
-      bom: true,
-      relax_column_count: true,
-      relax_quotes: true,
-      skip_empty_lines: true,
-      // TSV has no quoting convention; a literal " is just text.
-      quote: delimiter === '\t' ? false : '"',
-    })
+    // utf8 decoding on the stream keeps multi-byte characters intact across chunk boundaries.
+    // pipeline (unlike pipe) forwards read errors such as EISDIR or EACCES to the parser, so
+    // they reject this loop instead of crashing the server, and closes the file on any failure.
+    const parsed = pipeline(createReadStream(path, { encoding: 'utf8' }), parser, () => {})
+    for await (const record of parsed) {
+      if (!header) {
+        header = record
+        trackers = record.map(() => new ColumnTypeTracker())
+        continue
+      }
+      for (let i = 0; i < trackers.length; i++) trackers[i].observe(record[i] ?? '')
+      records.push(record)
+    }
   } catch (error) {
     throw new Error(`Could not parse ${path}: ${/** @type {Error} */ (error).message}`)
   }
-  const [header = [], ...body] = records
-  const columns = uniqueNames(header)
-  const casters = columns.map((_, i) => columnCaster(body.map(record => record[i] ?? '')))
+  const columns = uniqueNames(header ?? [])
+  const casters = trackers.map(tracker => tracker.caster())
+  // Convert in place so raw records and row objects aren't both held for the whole file.
   // fromEntries defines own properties, so a header like "__proto__" stays a column.
-  const rows = body.map(record => Object.fromEntries(columns.map((name, i) => [name, casters[i](record[i] ?? '')])))
+  /** @type {Record<string, any>[]} */
+  const rows = /** @type {any} */ (records)
+  for (let r = 0; r < records.length; r++) {
+    const record = records[r]
+    rows[r] = Object.fromEntries(columns.map((name, i) => [name, casters[i](record[i] ?? '')]))
+  }
   return { columns, rows }
 }
 
 /**
- * @param {string} text
  * @param {string} path
  */
-function parseJsonLines(text, path) {
+async function parseJsonLines(path) {
   /** @type {Record<string, any>[]} */
   const rows = []
   /** @type {Set<string>} */
   const columns = new Set()
-  text.replace(/^\uFEFF/, '').split(/\r?\n/).forEach((line, i) => {
-    if (!line.trim()) return
-    let value
-    try {
-      value = JSON.parse(line)
-    } catch (error) {
-      throw new Error(`Invalid JSON on line ${i + 1} of ${path}: ${/** @type {Error} */ (error).message}`)
+  const input = createReadStream(path, { encoding: 'utf8' })
+  const lines = createInterface({ input, crlfDelay: Infinity })
+  let lineNumber = 0
+  /** @type {string | undefined} */
+  let invalidJson
+  try {
+    for await (const rawLine of lines) {
+      lineNumber++
+      const line = lineNumber === 1 ? rawLine.replace(/^\uFEFF/, '') : rawLine
+      if (!line.trim()) continue
+      let value
+      try {
+        value = JSON.parse(line)
+      } catch (error) {
+        invalidJson = /** @type {Error} */ (error).message
+        break
+      }
+      const row = value !== null && typeof value === 'object' && !Array.isArray(value) ? value : { value }
+      for (const key of Object.keys(row)) columns.add(key)
+      rows.push(row)
     }
-    const row = value !== null && typeof value === 'object' && !Array.isArray(value) ? value : { value }
-    for (const key of Object.keys(row)) columns.add(key)
-    rows.push(row)
-  })
+  } catch (error) {
+    // Read errors (EISDIR, EACCES, ...), worded like the CSV path's.
+    throw new Error(`Could not parse ${path}: ${/** @type {Error} */ (error).message}`)
+  } finally {
+    // Closing readline leaves the file open after an early break, so release it explicitly.
+    lines.close()
+    input.destroy()
+  }
+  if (invalidJson !== undefined) {
+    throw new Error(`Invalid JSON on line ${lineNumber} of ${path}: ${invalidJson}`)
+  }
   const names = [...columns]
   // SQL needs every row to expose every column.
   for (const row of rows) for (const name of names) if (!Object.hasOwn(row, name)) row[name] = null

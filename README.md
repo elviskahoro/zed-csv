@@ -32,7 +32,7 @@ Example prompts:
 - "What are the top 10 vendors by total fare in `data/trips.parquet`?"
 - "Convert `data/trips.parquet` to CSV", then open `trips.preview.csv` and run `tabular data: open preview`
 
-Parquet files are read one row group at a time, so large files aren't loaded fully into memory. CSV, TSV, and JSONL files are parsed in full.
+Parquet files are read one row group at a time, so large files aren't loaded fully into memory. CSV, TSV, and JSONL files are parsed in full on every tool call, like Zed's own CSV preview. That works up to 1 GiB, needs about 5× the file size in memory, and takes tens of seconds per call for files in the hundreds of MB. Convert bigger files to Parquet.
 
 ## Settings
 
