@@ -1,0 +1,1408 @@
+From 88e39870a7f94e921d687ebc7b917dd8e1dedf35 Mon Sep 17 00:00:00 2001
+From: elvis kahoro <github@elvis.ai>
+Date: Sun, 15 Nov 2026 21:37:44 +0000
+Subject: [PATCH] tabular_data_preview: Open Parquet files in the table view
+
+Parquet is binary, so the text-buffer path rejects it with "Binary files
+are not supported" before the CSV preview can see it. Claim .parquet as
+a project item instead, decode it off the main thread with the parquet
+crate (row API, no arrow), and feed the result to the existing TableView
+so sorting and filtering work unchanged.
+
+Decoding stops at 100,000 rows and the view says how many were shown.
+Files over 512 MB, or whose previewed row groups would decompress past
+1 GB per the footer, are refused because the whole file is read before
+decoding. The view re-reads the file when it changes on disk, keeping
+the last good rows if the new contents fail to decode. Remote worktrees
+can't load binary files yet, so they are left to the default handler.
+---
+ Cargo.lock                                    |  73 ++-
+ Cargo.toml                                    |   1 +
+ crates/tabular_data_preview/Cargo.toml        |   5 +
+ .../src/parquet_preview.rs                    | 609 ++++++++++++++++++
+ .../src/parquet_preview/decode.rs             | 456 +++++++++++++
+ .../src/table_data_engine.rs                  |   5 +-
+ crates/tabular_data_preview/src/table_view.rs |   9 +-
+ .../src/tabular_data_preview.rs               |   2 +
+ .../src/types/table_cell.rs                   |   3 +-
+ 9 files changed, 1154 insertions(+), 9 deletions(-)
+ create mode 100644 crates/tabular_data_preview/src/parquet_preview.rs
+ create mode 100644 crates/tabular_data_preview/src/parquet_preview/decode.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 0719da6..b9dabcd 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2204,7 +2204,7 @@ checksum = "1a22f228ab7a1b23027ccc6c350b72868017af7ea8356fbdf19f8d991c690013"
+ dependencies = [
+  "autocfg",
+  "libm",
+- "num-bigint",
++ "num-bigint 0.4.8",
+  "num-integer",
+  "num-traits",
+  "serde",
+@@ -6532,7 +6532,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "33fee0259ffdc3d7bd64438b6b08437884d4df5700f9cb8a23b079c3958ae578"
+ dependencies = [
+  "num",
+- "num-bigint",
++ "num-bigint 0.4.8",
+ ]
+ 
+ [[package]]
+@@ -10454,6 +10454,15 @@ dependencies = [
+  "num-traits",
+ ]
+ 
++[[package]]
++name = "lz4_flex"
++version = "0.14.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "f56455fff36934a9500d69062aec1c77037179b6f0669e4d5d6b72b84722d6a3"
++dependencies = [
++ "twox-hash",
++]
++
+ [[package]]
+ name = "mac-notification-sys"
+ version = "0.6.15"
+@@ -11457,7 +11466,7 @@ version = "0.4.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
+ dependencies = [
+- "num-bigint",
++ "num-bigint 0.4.8",
+  "num-complex",
+  "num-integer",
+  "num-iter",
+@@ -11475,6 +11484,16 @@ dependencies = [
+  "num-traits",
+ ]
+ 
++[[package]]
++name = "num-bigint"
++version = "0.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "93e7820bc0a80a0238e650327316f929ba18d5be054b647490a3a6a339f3e7c0"
++dependencies = [
++ "num-integer",
++ "num-traits",
++]
++
+ [[package]]
+ name = "num-bigint-dig"
+ version = "0.8.6"
+@@ -11566,7 +11585,7 @@ version = "0.4.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
+ dependencies = [
+- "num-bigint",
++ "num-bigint 0.4.8",
+  "num-integer",
+  "num-traits",
+ ]
+@@ -12547,6 +12566,28 @@ dependencies = [
+  "windows-link 0.2.1",
+ ]
+ 
++[[package]]
++name = "parquet"
++version = "59.3.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8eb260d566f2fbdabe356d26aaa5d13403aac29b5b4e44463b8f9bd7b2b12680"
++dependencies = [
++ "ahash",
++ "bytes 1.12.1",
++ "chrono",
++ "flate2",
++ "half",
++ "hashbrown 0.17.1",
++ "lz4_flex",
++ "num-bigint 0.5.1",
++ "num-integer",
++ "num-traits",
++ "seq-macro",
++ "snap",
++ "twox-hash",
++ "zstd",
++]
++
+ [[package]]
+ name = "parse_int"
+ version = "0.9.0"
+@@ -16156,6 +16197,12 @@ version = "0.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
+ 
++[[package]]
++name = "seq-macro"
++version = "0.3.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1bc711410fbe7399f390ca1c3b60ad0f53f80e95c5eb935e52268a0e2cd49acc"
++
+ [[package]]
+ name = "serde"
+ version = "1.0.229"
+@@ -16762,7 +16809,7 @@ version = "0.6.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "297f631f50729c8c99b84667867963997ec0b50f32b2a7dbcab828ef0541e8bb"
+ dependencies = [
+- "num-bigint",
++ "num-bigint 0.4.8",
+  "num-traits",
+  "thiserror 2.0.21",
+  "time",
+@@ -16903,6 +16950,12 @@ dependencies = [
+  "syn 2.0.117",
+ ]
+ 
++[[package]]
++name = "snap"
++version = "1.1.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
++
+ [[package]]
+ name = "snippet"
+ version = "0.1.0"
+@@ -17881,11 +17934,14 @@ name = "tabular_data_preview"
+ version = "0.1.0"
+ dependencies = [
+  "anyhow",
++ "bytes 1.12.1",
++ "chrono",
+  "editor",
+  "fuzzy",
+  "gpui",
+  "indexmap 2.14.2",
+  "log",
++ "parquet",
+  "picker",
+  "project",
+  "proptest",
+@@ -17896,6 +17952,7 @@ dependencies = [
+  "ui",
+  "util",
+  "workspace",
++ "worktree",
+ ]
+ 
+ [[package]]
+@@ -19228,6 +19285,12 @@ dependencies = [
+  "utf-8",
+ ]
+ 
++[[package]]
++name = "twox-hash"
++version = "2.1.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
++
+ [[package]]
+ name = "typed-path"
+ version = "0.13.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index a5ad9f5..c3d441f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -832,6 +832,7 @@ oo7 = { git = "https://github.com/zed-industries/oo7", rev = "731c1215edb6905876
+ ordered-float = "5"
+ palette = { version = "0.7.5", default-features = false, features = ["std"] }
+ parking_lot = "0.12.1"
++parquet = { version = "59.3", default-features = false, features = ["snap", "zstd", "flate2-rust_backend", "lz4"] }
+ parse_int = "0.9"
+ partial-json-fixer = "0.5.3"
+ pathfinder_geometry = "0.5"
+diff --git a/crates/tabular_data_preview/Cargo.toml b/crates/tabular_data_preview/Cargo.toml
+index 092353c..676ce33 100644
+--- a/crates/tabular_data_preview/Cargo.toml
++++ b/crates/tabular_data_preview/Cargo.toml
+@@ -10,6 +10,8 @@ doctest = false
+ 
+ [dependencies]
+ anyhow.workspace = true
++bytes.workspace = true
++chrono.workspace = true
+ fuzzy.workspace = true
+ gpui.workspace = true
+ editor.workspace = true
+@@ -18,11 +20,14 @@ ui.workspace = true
+ workspace.workspace = true
+ log.workspace = true
+ indexmap.workspace = true
++parquet.workspace = true
++project.workspace = true
+ serde.workspace = true
+ serde_json.workspace = true
+ schemars.workspace = true
+ text.workspace = true
+ util.workspace = true
++worktree.workspace = true
+ 
+ [dev-dependencies]
+ gpui = { workspace = true, features = ["test-support"] }
+diff --git a/crates/tabular_data_preview/src/parquet_preview.rs b/crates/tabular_data_preview/src/parquet_preview.rs
+new file mode 100644
+index 0000000..ff40e56
+--- /dev/null
++++ b/crates/tabular_data_preview/src/parquet_preview.rs
+@@ -0,0 +1,609 @@
++//! Opens `.parquet` files directly in a read-only [`TableView`].
++//!
++//! Parquet is binary, so the text-buffer path rejects it before the editor-backed
++//! [`crate::TabularDataPreviewPane`] could see it. Instead, [`ParquetItem`] claims the path
++//! as a project item, decodes it on a background thread, and [`ParquetView`] hands the
++//! result to the same table component the CSV preview uses.
++
++mod decode;
++
++use std::{path::Path, sync::Arc};
++
++use anyhow::{Context as _, Result};
++use bytes::Bytes;
++use gpui::{
++    App, AppContext as _, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
++    Subscription, Task, Window,
++};
++use project::{Fs, MTime, Project, ProjectEntryId, ProjectPath, Worktree};
++use ui::{SharedString, prelude::*, table_row::TableRow};
++use util::rel_path::RelPath;
++use workspace::{
++    Pane,
++    invalid_item_view::InvalidItemView,
++    item::{Item, ItemBufferKind, ProjectItem},
++};
++
++use crate::TableView;
++use crate::types::{LineNumber, TableCell, TableLikeContent};
++use decode::{DecodeLimits, DecodedParquet, decode_parquet};
++
++const PARQUET_EXTENSION: &str = "parquet";
++
++/// Rows beyond this are not decoded, which bounds the size of the table and the decode time.
++const MAX_ROWS: usize = 100_000;
++
++/// Limit on how much the previewed rows may decompress to, since highly compressible columns
++/// can expand far beyond the file size. Checked against the footer up front and against the
++/// text actually decoded as rows are read.
++const MAX_DECODED_BYTES: u64 = 1024 * 1024 * 1024;
++
++// The whole file is read into memory before decoding, so very large files are refused
++// rather than risking the editor's memory.
++#[cfg(not(test))]
++const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
++#[cfg(test)]
++const MAX_FILE_BYTES: u64 = 64 * 1024;
++
++pub fn init(cx: &mut App) {
++    workspace::register_project_item::<ParquetView>(cx);
++}
++
++pub struct ParquetItem {
++    project_path: ProjectPath,
++    fs: Arc<dyn Fs>,
++    entry_id: Option<ProjectEntryId>,
++    content: Arc<TableLikeContent>,
++    total_rows: Option<usize>,
++    /// Whether more rows exist than were decoded.
++    truncated: bool,
++    /// Set when re-reading the file after a change on disk failed; the previous rows stay visible.
++    reload_error: Option<SharedString>,
++    reload_task: Option<Task<()>>,
++    _worktree_subscription: Subscription,
++}
++
++pub enum ParquetItemEvent {
++    Reloaded,
++}
++
++impl EventEmitter<ParquetItemEvent> for ParquetItem {}
++
++struct LoadedParquet {
++    entry_id: Option<ProjectEntryId>,
++    /// Modification time of the file as read, to detect changes that raced the initial open.
++    mtime: Option<MTime>,
++    content: TableLikeContent,
++    total_rows: Option<usize>,
++    /// Whether more rows exist than were decoded.
++    truncated: bool,
++}
++
++fn is_parquet_path(project: &Entity<Project>, path: &ProjectPath, cx: &App) -> bool {
++    let is_parquet = |extension: Option<&str>| {
++        extension.is_some_and(|ext| ext.eq_ignore_ascii_case(PARQUET_EXTENSION))
++    };
++    // Single-file worktrees have an empty relative path, so fall back to the absolute path.
++    is_parquet(path.path.extension())
++        || project
++            .read(cx)
++            .absolute_path(path, cx)
++            .is_some_and(|abs_path| is_parquet(abs_path.extension().and_then(|ext| ext.to_str())))
++}
++
++fn ensure_within_size_limit(size: u64) -> Result<()> {
++    anyhow::ensure!(
++        size <= MAX_FILE_BYTES,
++        "Parquet files larger than {:.1} MB can't be previewed (this one is {:.1} MB)",
++        megabytes(MAX_FILE_BYTES),
++        megabytes(size)
++    );
++    Ok(())
++}
++
++fn megabytes(bytes: u64) -> f64 {
++    bytes as f64 / (1024.0 * 1024.0)
++}
++
++fn load_parquet(
++    fs: Arc<dyn Fs>,
++    worktree: Entity<Worktree>,
++    path: Arc<RelPath>,
++    cx: &mut App,
++) -> Task<Result<LoadedParquet>> {
++    let abs_path = worktree.read(cx).absolutize(&path);
++    cx.spawn(async move |cx| {
++        // Ask the filesystem rather than the worktree snapshot, which may not have scanned the
++        // entry yet; an unknown size must not bypass the limit.
++        let size = fs
++            .metadata(&abs_path)
++            .await?
++            .with_context(|| format!("{} does not exist", abs_path.display()))?
++            .len;
++        ensure_within_size_limit(size)?;
++        let loaded = worktree
++            .update(cx, |worktree, cx| worktree.load_binary_file(&path, cx))
++            .await?;
++        // The file may have grown between the size check and the read.
++        ensure_within_size_limit(loaded.content.len() as u64)?;
++        let entry_id = loaded.file.entry_id;
++        let mtime = loaded.file.disk_state.mtime();
++        let (content, total_rows, truncated) = cx
++            .background_spawn(async move {
++                let decoded = decode_parquet(
++                    Bytes::from(loaded.content),
++                    DecodeLimits {
++                        max_rows: MAX_ROWS,
++                        max_uncompressed_bytes: MAX_DECODED_BYTES,
++                        max_decoded_text_bytes: MAX_DECODED_BYTES,
++                    },
++                )?;
++                let (total_rows, truncated) = (decoded.total_rows, decoded.truncated);
++                anyhow::Ok((table_content(decoded)?, total_rows, truncated))
++            })
++            .await
++            .context("decoding Parquet file")?;
++        Ok(LoadedParquet {
++            entry_id,
++            mtime,
++            content,
++            total_rows,
++            truncated,
++        })
++    })
++}
++
++impl ParquetItem {
++    fn new(
++        project_path: ProjectPath,
++        fs: Arc<dyn Fs>,
++        worktree: &Entity<Worktree>,
++        loaded: LoadedParquet,
++        cx: &mut Context<Self>,
++    ) -> Self {
++        let _worktree_subscription = cx.subscribe(worktree, |this, worktree, event, cx| {
++            if let worktree::Event::UpdatedEntries(changes) = event
++                && changes
++                    .iter()
++                    .any(|(path, _, _)| *path == this.project_path.path)
++            {
++                this.reload(worktree, cx);
++            }
++        });
++        let current_mtime = worktree
++            .read(cx)
++            .entry_for_path(&project_path.path)
++            .and_then(|entry| entry.mtime);
++        let mut this = Self {
++            project_path,
++            fs,
++            entry_id: loaded.entry_id,
++            content: Arc::new(loaded.content),
++            total_rows: loaded.total_rows,
++            truncated: loaded.truncated,
++            reload_error: None,
++            reload_task: None,
++            _worktree_subscription,
++        };
++        // The file may have changed between the read and the subscription above, in which case
++        // its change event was missed.
++        if current_mtime.is_some() && current_mtime != loaded.mtime {
++            this.reload(worktree.clone(), cx);
++        }
++        this
++    }
++
++    fn reload(&mut self, worktree: Entity<Worktree>, cx: &mut Context<Self>) {
++        let load = load_parquet(
++            self.fs.clone(),
++            worktree,
++            self.project_path.path.clone(),
++            cx,
++        );
++        // Replacing the task drops (and so cancels) any reload still in flight, so an older
++        // read can never land after a newer one.
++        self.reload_task = Some(cx.spawn(async move |this, cx| {
++            let loaded = load.await;
++            this.update(cx, |this, cx| {
++                match loaded {
++                    Ok(loaded) => {
++                        this.entry_id = loaded.entry_id;
++                        this.content = Arc::new(loaded.content);
++                        this.total_rows = loaded.total_rows;
++                        this.truncated = loaded.truncated;
++                        this.reload_error = None;
++                    }
++                    Err(error) => {
++                        this.reload_error = Some(format!("{error:#}").into());
++                    }
++                }
++                cx.emit(ParquetItemEvent::Reloaded);
++            })
++            .ok();
++        }));
++    }
++}
++
++impl project::ProjectItem for ParquetItem {
++    fn try_open(
++        project: &Entity<Project>,
++        path: &ProjectPath,
++        cx: &mut App,
++    ) -> Option<Task<Result<Entity<Self>>>> {
++        if !is_parquet_path(project, path, cx) {
++            return None;
++        }
++        let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
++        // Remote worktrees can't load binary files yet; leave those paths to the default handler.
++        if !worktree.read(cx).is_local() {
++            return None;
++        }
++        let fs = project.read(cx).fs().clone();
++        let load = load_parquet(fs.clone(), worktree.clone(), path.path.clone(), cx);
++        let project_path = path.clone();
++
++        Some(cx.spawn(async move |cx| {
++            let loaded = load.await?;
++            Ok(cx.new(|cx| ParquetItem::new(project_path, fs, &worktree, loaded, cx)))
++        }))
++    }
++
++    fn entry_id(&self, _: &App) -> Option<ProjectEntryId> {
++        self.entry_id
++    }
++
++    fn project_path(&self, _: &App) -> Option<ProjectPath> {
++        Some(self.project_path.clone())
++    }
++
++    fn is_dirty(&self) -> bool {
++        false
++    }
++}
++
++fn table_content(decoded: DecodedParquet) -> Result<TableLikeContent> {
++    let number_of_cols = decoded.headers.len();
++    let to_row = |values: Vec<String>| {
++        let cells = values
++            .into_iter()
++            .map(|value| TableCell::Generated(value.into()))
++            .collect();
++        TableRow::try_from_vec(cells, number_of_cols).map_err(anyhow::Error::msg)
++    };
++    let line_numbers = (1..=decoded.rows.len()).map(LineNumber::Line).collect();
++    Ok(TableLikeContent {
++        number_of_cols,
++        headers: to_row(decoded.headers)?,
++        rows: decoded
++            .rows
++            .into_iter()
++            .map(to_row)
++            .collect::<Result<_>>()?,
++        line_numbers,
++    })
++}
++
++pub struct ParquetView {
++    item: Entity<ParquetItem>,
++    pub(crate) table: Entity<TableView>,
++    _item_subscription: Subscription,
++}
++
++impl ProjectItem for ParquetView {
++    type Item = ParquetItem;
++
++    fn for_project_item(
++        _project: Entity<Project>,
++        _pane: Option<&Pane>,
++        item: Entity<Self::Item>,
++        window: &mut Window,
++        cx: &mut Context<Self>,
++    ) -> Self {
++        let content = item.read(cx).content.clone();
++        let table = cx.new(|cx| {
++            let mut table = TableView::new(window, cx);
++            table.set_contents(content, cx);
++            table
++        });
++        let _item_subscription = cx.subscribe(&item, |this, item, event, cx| match event {
++            ParquetItemEvent::Reloaded => {
++                let content = item.read(cx).content.clone();
++                this.table
++                    .update(cx, |table, cx| table.set_contents(content, cx));
++                cx.notify();
++            }
++        });
++        Self {
++            item,
++            table,
++            _item_subscription,
++        }
++    }
++
++    fn for_broken_project_item(
++        abs_path: &Path,
++        is_local: bool,
++        e: &anyhow::Error,
++        window: &mut Window,
++        cx: &mut App,
++    ) -> Option<InvalidItemView> {
++        Some(InvalidItemView::new(abs_path, is_local, e, window, cx))
++    }
++}
++
++impl EventEmitter<()> for ParquetView {}
++
++impl Focusable for ParquetView {
++    fn focus_handle(&self, cx: &App) -> FocusHandle {
++        self.table.read(cx).focus_handle(cx)
++    }
++}
++
++impl Render for ParquetView {
++    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
++        let item = self.item.read(cx);
++        let shown_rows = item.content.rows.len();
++        let truncation_notice = item.truncated.then(|| match item.total_rows {
++            Some(total_rows) if total_rows > shown_rows => {
++                format!("Showing the first {shown_rows} of {total_rows} rows")
++            }
++            _ => format!("Showing the first {shown_rows} rows"),
++        });
++        let notice = |text: SharedString, color: Color| {
++            h_flex()
++                .px_2()
++                .py_1()
++                .child(Label::new(text).size(LabelSize::Small).color(color))
++        };
++        v_flex()
++            .size_full()
++            .when_some(item.reload_error.clone(), |this, error| {
++                this.child(notice(
++                    format!("Showing the last successfully read version: {error}").into(),
++                    Color::Error,
++                ))
++            })
++            .when_some(truncation_notice, |this, text| {
++                this.child(notice(text.into(), Color::Muted))
++            })
++            .child(self.table.clone())
++    }
++}
++
++impl Item for ParquetView {
++    type Event = ();
++
++    fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
++        Some(Icon::new(IconName::Table))
++    }
++
++    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
++        self.item
++            .read(cx)
++            .project_path
++            .path
++            .file_name()
++            .map(|name| SharedString::from(name.to_string()))
++            .unwrap_or_else(|| "Parquet".into())
++    }
++
++    fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
++        Some(
++            self.item
++                .read(cx)
++                .project_path
++                .path
++                .as_unix_str()
++                .to_string()
++                .into(),
++        )
++    }
++
++    fn for_each_project_item(
++        &self,
++        cx: &App,
++        f: &mut dyn FnMut(EntityId, &dyn project::ProjectItem),
++    ) {
++        f(self.item.entity_id(), self.item.read(cx))
++    }
++
++    fn buffer_kind(&self, _: &App) -> ItemBufferKind {
++        ItemBufferKind::Singleton
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::types::DataRow;
++    use decode::tests::sample_parquet;
++    use gpui::TestAppContext;
++    use parquet::basic::Compression;
++    use project::FakeFs;
++    use serde_json::json;
++    use std::path::PathBuf;
++    use util::path;
++    use workspace::{AppState, OpenOptions, Workspace};
++
++    fn init_test(cx: &mut TestAppContext) {
++        cx.update(|cx| {
++            AppState::test(cx);
++            editor::init(cx);
++            crate::init(cx);
++        });
++    }
++
++    #[gpui::test]
++    async fn test_opens_parquet_files_in_a_table(cx: &mut TestAppContext) {
++        init_test(cx);
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree(path!("/project"), json!({ "notes.txt": "plain" }))
++            .await;
++        fs.insert_file(
++            path!("/project/data.parquet"),
++            sample_parquet(&[&[0, 1, 2], &[3]], Compression::SNAPPY).to_vec(),
++        )
++        .await;
++        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
++        let (workspace, cx) =
++            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
++
++        let item = workspace
++            .update_in(cx, |workspace, window, cx| {
++                workspace.open_abs_path(
++                    PathBuf::from(path!("/project/data.parquet")),
++                    OpenOptions::default(),
++                    window,
++                    cx,
++                )
++            })
++            .await
++            .unwrap();
++        let view = item
++            .downcast::<ParquetView>()
++            .expect("a .parquet file should open in ParquetView");
++        cx.run_until_parked();
++
++        view.read_with(cx, |view, cx| {
++            let contents = &view.table.read(cx).engine.contents;
++            let headers = contents
++                .headers
++                .as_slice()
++                .iter()
++                .map(|cell| cell.display_value().unwrap().to_string())
++                .collect::<Vec<_>>();
++            assert_eq!(headers, ["id", "name", "score", "seen"]);
++            assert_eq!(contents.rows.len(), 4);
++            let last_row = contents.get_row(DataRow(3)).unwrap();
++            assert_eq!(last_row[0].display_value().unwrap().as_ref(), "3");
++            assert_eq!(view.tab_content_text(0, cx), "data.parquet");
++        });
++
++        let text = workspace
++            .update_in(cx, |workspace, window, cx| {
++                workspace.open_abs_path(
++                    PathBuf::from(path!("/project/notes.txt")),
++                    OpenOptions::default(),
++                    window,
++                    cx,
++                )
++            })
++            .await
++            .unwrap();
++        assert!(
++            text.downcast::<ParquetView>().is_none(),
++            "only .parquet files should be claimed"
++        );
++    }
++
++    #[gpui::test]
++    async fn test_reloads_when_the_file_changes_on_disk(cx: &mut TestAppContext) {
++        init_test(cx);
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree(path!("/project"), json!({})).await;
++        let file = path!("/project/data.parquet");
++        fs.insert_file(
++            file,
++            sample_parquet(&[&[0, 1]], Compression::SNAPPY).to_vec(),
++        )
++        .await;
++        let project = Project::test(fs.clone(), [Path::new(path!("/project"))], cx).await;
++        let (workspace, cx) =
++            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
++        let view = workspace
++            .update_in(cx, |workspace, window, cx| {
++                workspace.open_abs_path(PathBuf::from(file), OpenOptions::default(), window, cx)
++            })
++            .await
++            .unwrap()
++            .downcast::<ParquetView>()
++            .unwrap();
++        cx.run_until_parked();
++        let row_count = |view: &Entity<ParquetView>, cx: &mut gpui::VisualTestContext| {
++            view.read_with(cx, |view, cx| {
++                view.table.read(cx).engine.contents.rows.len()
++            })
++        };
++        assert_eq!(row_count(&view, cx), 2);
++
++        fs.insert_file(
++            file,
++            sample_parquet(&[&[0, 1, 2], &[3, 4]], Compression::SNAPPY).to_vec(),
++        )
++        .await;
++        cx.run_until_parked();
++        assert_eq!(
++            row_count(&view, cx),
++            5,
++            "the table should follow the file on disk"
++        );
++
++        fs.insert_file(file, b"no longer parquet".to_vec()).await;
++        cx.run_until_parked();
++        assert_eq!(
++            row_count(&view, cx),
++            5,
++            "a bad rewrite keeps the last good rows"
++        );
++        view.read_with(cx, |view, cx| {
++            assert!(view.item.read(cx).reload_error.is_some());
++        });
++    }
++
++    #[gpui::test]
++    async fn test_refuses_files_over_the_size_limit(cx: &mut TestAppContext) {
++        init_test(cx);
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree(path!("/project"), json!({})).await;
++        fs.insert_file(
++            path!("/project/huge.parquet"),
++            vec![0; MAX_FILE_BYTES as usize + 1],
++        )
++        .await;
++        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
++        let (workspace, cx) =
++            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
++        let item = workspace
++            .update_in(cx, |workspace, window, cx| {
++                workspace.open_abs_path(
++                    PathBuf::from(path!("/project/huge.parquet")),
++                    OpenOptions::default(),
++                    window,
++                    cx,
++                )
++            })
++            .await
++            .expect("an oversized file should open as an error view");
++        assert!(item.downcast::<InvalidItemView>().is_some());
++    }
++
++    #[gpui::test]
++    async fn test_invalid_parquet_reports_an_error_instead_of_a_table(cx: &mut TestAppContext) {
++        init_test(cx);
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree(
++            path!("/project"),
++            json!({ "broken.parquet": "not parquet" }),
++        )
++        .await;
++        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
++        let (workspace, cx) =
++            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
++
++        let opened = workspace
++            .update_in(cx, |workspace, window, cx| {
++                workspace.open_abs_path(
++                    PathBuf::from(path!("/project/broken.parquet")),
++                    OpenOptions::default(),
++                    window,
++                    cx,
++                )
++            })
++            .await;
++        let item = opened.expect("a broken file should still open, as an error view");
++        assert!(
++            item.downcast::<InvalidItemView>().is_some(),
++            "a file that fails to decode should show the error view, not an empty table"
++        );
++    }
++}
+diff --git a/crates/tabular_data_preview/src/parquet_preview/decode.rs b/crates/tabular_data_preview/src/parquet_preview/decode.rs
+new file mode 100644
+index 0000000..30f57c7
+--- /dev/null
++++ b/crates/tabular_data_preview/src/parquet_preview/decode.rs
+@@ -0,0 +1,456 @@
++//! Decodes Parquet bytes into plain strings for display.
++//!
++//! Kept free of GPUI types so it can be unit-tested in isolation.
++
++use anyhow::{Context as _, Result};
++use bytes::Bytes;
++use chrono::DateTime;
++use parquet::file::reader::{FileReader, SerializedFileReader};
++use parquet::record::Field;
++
++pub(crate) struct DecodedParquet {
++    pub headers: Vec<String>,
++    pub rows: Vec<Vec<String>>,
++    /// Row count from the file footer, or `None` if the footer's count is invalid.
++    pub total_rows: Option<usize>,
++    /// Whether rows remained after `max_rows`, observed while reading rather than taken from
++    /// the footer, which may disagree with the row groups.
++    pub truncated: bool,
++}
++
++pub(crate) struct DecodeLimits {
++    pub max_rows: usize,
++    /// Upper bound on the uncompressed size, per the footer, of the row groups that would be
++    /// read to produce `max_rows` rows. Checked before decoding so dense files fail fast; the
++    /// footer isn't verified, so `max_decoded_text_bytes` backs it up during decoding.
++    pub max_uncompressed_bytes: u64,
++    /// Upper bound on the text actually produced for the table, enforced row by row.
++    pub max_decoded_text_bytes: u64,
++}
++
++/// Decodes at most `limits.max_rows` rows.
++pub(crate) fn decode_parquet(bytes: Bytes, limits: DecodeLimits) -> Result<DecodedParquet> {
++    let DecodeLimits {
++        max_rows,
++        max_uncompressed_bytes,
++        max_decoded_text_bytes,
++    } = limits;
++    let reader = SerializedFileReader::new(bytes).context("not a valid Parquet file")?;
++
++    let mut rows_covered = 0usize;
++    let mut uncompressed_bytes = 0u64;
++    for row_group in reader.metadata().row_groups() {
++        if rows_covered >= max_rows {
++            break;
++        }
++        // Without valid sizes the decode cost can't be bounded up front, so refuse the file.
++        let (Ok(group_rows), Ok(group_bytes)) = (
++            usize::try_from(row_group.num_rows()),
++            u64::try_from(row_group.total_byte_size()),
++        ) else {
++            anyhow::bail!("the file's row group metadata is invalid");
++        };
++        rows_covered = rows_covered.saturating_add(group_rows);
++        uncompressed_bytes = uncompressed_bytes.saturating_add(group_bytes);
++    }
++    anyhow::ensure!(
++        uncompressed_bytes <= max_uncompressed_bytes,
++        "the rows to preview would take {} MB to decode, over the {} MB limit",
++        uncompressed_bytes / (1024 * 1024),
++        max_uncompressed_bytes / (1024 * 1024)
++    );
++
++    let file_metadata = reader.metadata().file_metadata();
++    let total_rows = usize::try_from(file_metadata.num_rows()).ok();
++    let headers = file_metadata
++        .schema_descr()
++        .root_schema()
++        .get_fields()
++        .iter()
++        .map(|field| field.name().to_string())
++        .collect::<Vec<_>>();
++
++    let mut rows = Vec::with_capacity(total_rows.unwrap_or(0).min(max_rows));
++    let mut decoded_text_bytes = 0u64;
++    let mut row_iter = reader.get_row_iter(None)?;
++    for row in row_iter.by_ref().take(max_rows) {
++        let row = row.context("reading Parquet row")?;
++        let values = row
++            .get_column_iter()
++            .map(|(_, field)| field_text(field))
++            .collect::<Vec<_>>();
++        decoded_text_bytes = values.iter().fold(decoded_text_bytes, |total, value| {
++            total.saturating_add(value.len() as u64)
++        });
++        anyhow::ensure!(
++            decoded_text_bytes <= max_decoded_text_bytes,
++            "the decoded rows exceed the {} MB preview limit",
++            max_decoded_text_bytes / (1024 * 1024)
++        );
++        rows.push(values);
++    }
++
++    let truncated = row_iter.next().is_some();
++
++    Ok(DecodedParquet {
++        headers,
++        rows,
++        total_rows,
++        truncated,
++    })
++}
++
++fn field_text(field: &Field) -> String {
++    match field {
++        Field::Null => String::new(),
++        Field::Str(value) => value.clone(),
++        Field::Group(_) | Field::ListInternal(_) | Field::MapInternal(_) => nested_text(field, 0),
++        // `Field`'s Display switches to scientific notation outside 1e-15..=1e19, which
++        // renders 0.0 as "0E0" and every negative number as e.g. "-1.5E0".
++        Field::Float16(value) => value.to_string(),
++        Field::Float(value) => value.to_string(),
++        Field::Double(value) => value.to_string(),
++        Field::Bytes(value) => match std::str::from_utf8(value.data()) {
++            Ok(text) => text.to_string(),
++            Err(_) => format!("<{} bytes>", value.len()),
++        },
++        // `Field`'s Display unwraps these conversions, which panics on out-of-range values.
++        Field::Date(days) => DateTime::from_timestamp(i64::from(*days) * 86_400, 0)
++            .map(|date| date.format("%Y-%m-%d").to_string())
++            .unwrap_or_else(|| days.to_string()),
++        Field::TimestampMillis(millis) => DateTime::from_timestamp_millis(*millis)
++            .map(|time| time.format("%Y-%m-%d %H:%M:%S%.3f").to_string())
++            .unwrap_or_else(|| millis.to_string()),
++        Field::TimestampMicros(micros) => DateTime::from_timestamp_micros(*micros)
++            .map(|time| time.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
++            .unwrap_or_else(|| micros.to_string()),
++        other => other.to_string(),
++    }
++}
++
++/// Nesting deeper than this is elided, so a pathological schema can't overflow the stack.
++const MAX_NESTING_DEPTH: usize = 64;
++
++/// Formats nested values ourselves rather than via `Field`'s Display, whose timestamp and
++/// date conversions unwrap and would abort Zed (its panic hook aborts) on out-of-range values.
++fn nested_text(field: &Field, depth: usize) -> String {
++    let is_nested = matches!(
++        field,
++        Field::Group(_) | Field::ListInternal(_) | Field::MapInternal(_)
++    );
++    if is_nested && depth >= MAX_NESTING_DEPTH {
++        return "…".to_string();
++    }
++    let child = |value: &Field| nested_text(value, depth + 1);
++    match field {
++        Field::Null => "null".to_string(),
++        Field::Str(value) => format!("{value:?}"),
++        Field::Group(row) => {
++            let fields = row
++                .get_column_iter()
++                .map(|(name, value)| format!("{name}: {}", child(value)))
++                .collect::<Vec<_>>();
++            format!("{{{}}}", fields.join(", "))
++        }
++        Field::ListInternal(list) => {
++            let elements = list.elements().iter().map(child).collect::<Vec<_>>();
++            format!("[{}]", elements.join(", "))
++        }
++        Field::MapInternal(map) => {
++            let entries = map
++                .entries()
++                .iter()
++                .map(|(key, value)| format!("{}: {}", child(key), child(value)))
++                .collect::<Vec<_>>();
++            format!("{{{}}}", entries.join(", "))
++        }
++        scalar => field_text(scalar),
++    }
++}
++
++#[cfg(test)]
++pub(crate) mod tests {
++    use super::*;
++    use parquet::basic::Compression;
++    use parquet::data_type::{ByteArray, ByteArrayType, DoubleType, Int64Type};
++    use parquet::file::properties::WriterProperties;
++    use parquet::file::writer::SerializedFileWriter;
++    use parquet::schema::parser::parse_message_type;
++    use std::sync::Arc;
++
++    fn limits(max_rows: usize) -> DecodeLimits {
++        DecodeLimits {
++            max_rows,
++            max_uncompressed_bytes: u64::MAX,
++            max_decoded_text_bytes: u64::MAX,
++        }
++    }
++
++    /// Writes `row_groups` row groups of `ids`, each with an id, a nullable name,
++    /// a nullable double, and a millisecond timestamp column.
++    pub(crate) fn sample_parquet(row_groups: &[&[i64]], compression: Compression) -> Bytes {
++        let schema = Arc::new(
++            parse_message_type(
++                "message sample {
++                    REQUIRED INT64 id;
++                    OPTIONAL BYTE_ARRAY name (UTF8);
++                    OPTIONAL DOUBLE score;
++                    REQUIRED INT64 seen (TIMESTAMP(MILLIS,true));
++                }",
++            )
++            .unwrap(),
++        );
++        let properties = Arc::new(
++            WriterProperties::builder()
++                .set_compression(compression)
++                .build(),
++        );
++        let mut buffer = Vec::new();
++        let mut writer = SerializedFileWriter::new(&mut buffer, schema, properties).unwrap();
++        for ids in row_groups {
++            let mut row_group = writer.next_row_group().unwrap();
++            let present = |id: &i64| i16::from(id % 3 != 0);
++
++            let mut column = row_group.next_column().unwrap().unwrap();
++            column
++                .typed::<Int64Type>()
++                .write_batch(ids, None, None)
++                .unwrap();
++            column.close().unwrap();
++
++            let mut column = row_group.next_column().unwrap().unwrap();
++            let names = ids
++                .iter()
++                .filter(|id| *id % 3 != 0)
++                .map(|id| ByteArray::from(format!("name, {id}").as_str()))
++                .collect::<Vec<_>>();
++            let levels = ids.iter().map(present).collect::<Vec<_>>();
++            column
++                .typed::<ByteArrayType>()
++                .write_batch(&names, Some(&levels), None)
++                .unwrap();
++            column.close().unwrap();
++
++            let mut column = row_group.next_column().unwrap().unwrap();
++            let scores = ids
++                .iter()
++                .filter(|id| *id % 3 != 0)
++                .map(|id| -(*id as f64) / 2.0)
++                .collect::<Vec<_>>();
++            column
++                .typed::<DoubleType>()
++                .write_batch(&scores, Some(&levels), None)
++                .unwrap();
++            column.close().unwrap();
++
++            let mut column = row_group.next_column().unwrap().unwrap();
++            let seen = ids
++                .iter()
++                .map(|id| 1_767_225_600_000 + id * 60_000)
++                .collect::<Vec<_>>();
++            column
++                .typed::<Int64Type>()
++                .write_batch(&seen, None, None)
++                .unwrap();
++            column.close().unwrap();
++
++            row_group.close().unwrap();
++        }
++        writer.close().unwrap();
++        Bytes::from(buffer)
++    }
++
++    #[test]
++    fn decodes_headers_rows_and_display_values() {
++        for compression in [
++            Compression::UNCOMPRESSED,
++            Compression::SNAPPY,
++            Compression::ZSTD(Default::default()),
++            Compression::GZIP(Default::default()),
++            Compression::LZ4_RAW,
++        ] {
++            let decoded = decode_parquet(sample_parquet(&[&[0, 1, 2]], compression), limits(100))
++                .unwrap_or_else(|error| panic!("{compression:?}: {error:#}"));
++            assert_eq!(decoded.headers, ["id", "name", "score", "seen"]);
++            assert_eq!(decoded.total_rows, Some(3));
++            assert!(!decoded.truncated);
++            assert_eq!(
++                decoded.rows,
++                [
++                    ["0", "", "", "2026-01-01 00:00:00.000"],
++                    ["1", "name, 1", "-0.5", "2026-01-01 00:01:00.000"],
++                    ["2", "name, 2", "-1", "2026-01-01 00:02:00.000"],
++                ],
++                "{compression:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn caps_rows_across_row_groups_but_reports_the_full_count() {
++        let bytes = sample_parquet(&[&[0, 1, 2], &[3, 4, 5], &[6, 7]], Compression::SNAPPY);
++        let decoded = decode_parquet(bytes, limits(4)).unwrap();
++        assert_eq!(decoded.total_rows, Some(8));
++        assert!(decoded.truncated);
++        let ids = decoded
++            .rows
++            .iter()
++            .map(|row| row[0].as_str())
++            .collect::<Vec<_>>();
++        assert_eq!(ids, ["0", "1", "2", "3"]);
++    }
++
++    #[test]
++    fn refuses_row_groups_that_decompress_past_the_limit() {
++        let bytes = sample_parquet(&[&[0, 1, 2], &[3, 4, 5]], Compression::SNAPPY);
++        let error = decode_parquet(
++            bytes.clone(),
++            DecodeLimits {
++                max_uncompressed_bytes: 1,
++                ..limits(100)
++            },
++        )
++        .err()
++        .expect("should refuse");
++        assert!(error.to_string().contains("over the"), "{error}");
++
++        // Only the row groups needed for `max_rows` count toward the limit.
++        let reader = SerializedFileReader::new(bytes.clone()).unwrap();
++        let first_group = reader.metadata().row_group(0).total_byte_size() as u64;
++        let decoded = decode_parquet(
++            bytes,
++            DecodeLimits {
++                max_uncompressed_bytes: first_group,
++                ..limits(3)
++            },
++        )
++        .unwrap();
++        assert_eq!(decoded.rows.len(), 3);
++    }
++
++    #[test]
++    fn stops_once_decoded_text_exceeds_the_limit() {
++        let bytes = sample_parquet(&[&[0, 1, 2, 3]], Compression::SNAPPY);
++        // One row of the sample is well over 20 bytes of text, so the second row trips it.
++        let error = decode_parquet(
++            bytes,
++            DecodeLimits {
++                max_decoded_text_bytes: 40,
++                ..limits(100)
++            },
++        )
++        .err()
++        .expect("should stop decoding");
++        assert!(error.to_string().contains("preview limit"), "{error}");
++    }
++
++    #[test]
++    fn rejects_non_parquet_and_truncated_input() {
++        assert!(decode_parquet(Bytes::from_static(b"not parquet"), limits(10)).is_err());
++        let bytes = sample_parquet(&[&[0, 1, 2]], Compression::SNAPPY);
++        let truncated = bytes.slice(..bytes.len() / 2);
++        assert!(decode_parquet(truncated, limits(10)).is_err());
++        assert!(decode_parquet(Bytes::new(), limits(10)).is_err());
++    }
++
++    #[test]
++    fn formats_out_of_range_timestamps_without_panicking() {
++        assert_eq!(
++            field_text(&Field::TimestampMillis(i64::MAX)),
++            i64::MAX.to_string()
++        );
++        assert_eq!(
++            field_text(&Field::TimestampMicros(i64::MIN)),
++            i64::MIN.to_string()
++        );
++        assert_eq!(field_text(&Field::Date(i32::MAX)), i32::MAX.to_string());
++        assert_eq!(field_text(&Field::Double(0.0)), "0");
++        assert_eq!(field_text(&Field::Null), "");
++    }
++
++    #[test]
++    fn elides_values_nested_past_the_depth_limit() {
++        use parquet::record::Row;
++        let mut value = Field::Int(1);
++        for _ in 0..MAX_NESTING_DEPTH + 10 {
++            value = Field::Group(Row::new(vec![("inner".to_string(), value)]));
++        }
++        let text = field_text(&value);
++        assert!(text.contains('…'), "deep nesting should be elided");
++        assert!(!text.contains('1'), "the innermost value is past the limit");
++        assert_eq!(text.matches('{').count(), MAX_NESTING_DEPTH);
++    }
++
++    #[test]
++    fn formats_nested_values_without_panicking() {
++        let schema = Arc::new(
++            parse_message_type(
++                "message nested {
++                    REQUIRED group meta {
++                        REQUIRED BYTE_ARRAY tag (UTF8);
++                        REQUIRED INT64 at (TIMESTAMP(MILLIS,true));
++                    }
++                    REQUIRED group tags (LIST) {
++                        REPEATED group list {
++                            REQUIRED BYTE_ARRAY element (UTF8);
++                        }
++                    }
++                }",
++            )
++            .unwrap(),
++        );
++        let mut buffer = Vec::new();
++        let mut writer =
++            SerializedFileWriter::new(&mut buffer, schema, Default::default()).unwrap();
++        let mut row_group = writer.next_row_group().unwrap();
++
++        let mut column = row_group.next_column().unwrap().unwrap();
++        column
++            .typed::<ByteArrayType>()
++            .write_batch(&[ByteArray::from("x"), ByteArray::from("y")], None, None)
++            .unwrap();
++        column.close().unwrap();
++
++        // An out-of-range timestamp inside a group: `Field`'s Display would panic here.
++        let mut column = row_group.next_column().unwrap().unwrap();
++        column
++            .typed::<Int64Type>()
++            .write_batch(&[0, i64::MAX], None, None)
++            .unwrap();
++        column.close().unwrap();
++
++        let mut column = row_group.next_column().unwrap().unwrap();
++        column
++            .typed::<ByteArrayType>()
++            .write_batch(
++                &[
++                    ByteArray::from("a"),
++                    ByteArray::from("b"),
++                    ByteArray::from("c"),
++                ],
++                Some(&[1, 1, 1]),
++                Some(&[0, 1, 0]),
++            )
++            .unwrap();
++        column.close().unwrap();
++
++        row_group.close().unwrap();
++        writer.close().unwrap();
++
++        let decoded = decode_parquet(Bytes::from(buffer), limits(10)).unwrap();
++        assert_eq!(decoded.headers, ["meta", "tags"]);
++        assert_eq!(
++            decoded.rows,
++            [
++                [
++                    "{tag: \"x\", at: 1970-01-01 00:00:00.000}".to_string(),
++                    "[\"a\", \"b\"]".to_string(),
++                ],
++                [
++                    format!("{{tag: \"y\", at: {}}}", i64::MAX),
++                    "[\"c\"]".to_string(),
++                ],
++            ]
++        );
++    }
++}
+diff --git a/crates/tabular_data_preview/src/table_data_engine.rs b/crates/tabular_data_preview/src/table_data_engine.rs
+index 2a3b40e..dd7b836 100644
+--- a/crates/tabular_data_preview/src/table_data_engine.rs
++++ b/crates/tabular_data_preview/src/table_data_engine.rs
+@@ -34,7 +34,8 @@ pub(crate) struct TableDataEngine {
+ }
+ 
+ impl TableDataEngine {
+-    pub(crate) fn set_contents(&mut self, contents: TableLikeContent) {
++    pub(crate) fn set_contents(&mut self, contents: impl Into<Arc<TableLikeContent>>) {
++        let contents = contents.into();
+         if self
+             .contents
+             .headers
+@@ -51,7 +52,7 @@ impl TableDataEngine {
+             self.filter_stack = FilterStack::default();
+             self.applied_sorting = None;
+         }
+-        self.contents = Arc::new(contents);
++        self.contents = contents;
+         // The previous mapping can reference rows removed by an edit. Keep it empty
+         // until the background filter/sort task builds a mapping for the new contents.
+         self.d2d_mapping = DisplayToDataMapping::default();
+diff --git a/crates/tabular_data_preview/src/table_view.rs b/crates/tabular_data_preview/src/table_view.rs
+index 4aa7a93..2015627 100644
+--- a/crates/tabular_data_preview/src/table_view.rs
++++ b/crates/tabular_data_preview/src/table_view.rs
+@@ -10,6 +10,7 @@
+ use std::{
+     collections::HashMap,
+     ops::RangeInclusive,
++    sync::Arc,
+     time::{Duration, Instant},
+ };
+ 
+@@ -166,7 +167,13 @@ impl TableView {
+ 
+     /// Replace the data shown by the grid. Recomputes filter menus and column widths, kicks off the
+     /// display-to-data recomputation, and clears the loading state.
+-    pub fn set_contents(&mut self, contents: TableLikeContent, cx: &mut Context<Self>) {
++    ///
++    /// Accepts an `Arc` so producers that keep their own copy (e.g. a Parquet item) can share it.
++    pub fn set_contents(
++        &mut self,
++        contents: impl Into<Arc<TableLikeContent>>,
++        cx: &mut Context<Self>,
++    ) {
+         self.engine.set_contents(contents);
+         // The old mapping may reference rows removed by this change. Clear it immediately
+         // rather than leaving the list showing stale rows until the background task below
+diff --git a/crates/tabular_data_preview/src/tabular_data_preview.rs b/crates/tabular_data_preview/src/tabular_data_preview.rs
+index ad51169..b9ebf14 100644
+--- a/crates/tabular_data_preview/src/tabular_data_preview.rs
++++ b/crates/tabular_data_preview/src/tabular_data_preview.rs
+@@ -10,6 +10,7 @@ use crate::parser::EditorState;
+ 
+ pub use crate::table_view::{CellSelection, PerformanceMetrics, TableView};
+ 
++mod parquet_preview;
+ mod parser;
+ mod renderer;
+ mod settings;
+@@ -77,6 +78,7 @@ pub struct TabularDataPreviewPane {
+ }
+ 
+ pub fn init(cx: &mut App) {
++    parquet_preview::init(cx);
+     cx.observe_new(|workspace: &mut Workspace, _, _| {
+         TabularDataPreviewPane::register(workspace);
+     })
+diff --git a/crates/tabular_data_preview/src/types/table_cell.rs b/crates/tabular_data_preview/src/types/table_cell.rs
+index 64ba8cb..0cd4d0d 100644
+--- a/crates/tabular_data_preview/src/types/table_cell.rs
++++ b/crates/tabular_data_preview/src/types/table_cell.rs
+@@ -20,7 +20,8 @@ pub enum TableCell {
+         /// Cached display value (for performance)
+         cached_value: SharedString,
+     },
+-    /// Display text without a source span, used for generated column headings.
++    /// Display text without a source span: generated column headings, or values decoded
++    /// from a binary format such as Parquet.
+     Generated(SharedString),
+     /// Virtual cell, created to pad malformed row
+     Virtual,
+-- 
+2.50.1
+

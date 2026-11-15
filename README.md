@@ -65,3 +65,7 @@ cargo build --release --target wasm32-wasip2
 ```
 
 CI checks that `dist/server.js` matches the sources.
+
+## Native Parquet preview (Zed patch prototype)
+
+[`upstream/zed/`](upstream/zed/README.md) holds a patch to Zed itself. It makes Zed's built-in table preview open `.parquet` files directly. The RWX pipeline in [`.rwx/zed-parquet.yml`](.rwx/zed-parquet.yml) builds and tests it, so you don't need a local Zed build.

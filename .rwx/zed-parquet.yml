@@ -1,0 +1,220 @@
+# Builds and tests the upstream Zed patches in upstream/zed/ against the pinned
+# Zed commit in upstream/zed/ZED_COMMIT.
+#
+#   rwx run .rwx/zed-parquet.yml --target test --target lint --wait   # inner loop: patch + tests + fmt/clippy
+#   rwx run .rwx/zed-parquet.yml --target report --wait   # adds release builds + size report
+#
+# The *-base tasks build unpatched Zed. Their inputs never change for a pinned commit,
+# so they run once and are cache hits afterwards; the patched tasks start from that
+# warm target dir and apply the patch themselves, so only touched crates recompile.
+
+on:
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.2.1
+
+aliases:
+  big-runner: &big-runner
+    cpus: 16
+    disk: 150gb
+  release-runner: &release-runner
+    cpus: 16
+    disk: 200gb
+
+tasks:
+  - key: code
+    call: git/clone 2.4.1
+    with:
+      repository: https://github.com/elviskahoro/zed-csv.git
+      ref: ${{ init.commit-sha }}
+
+  - key: zed-commit
+    use: code
+    filter: [upstream/zed/ZED_COMMIT]
+    run: tr -d '[:space:]' < upstream/zed/ZED_COMMIT | tee "$RWX_VALUES/sha"
+
+  - key: zed-src
+    call: git/clone 2.4.1
+    with:
+      repository: https://github.com/zed-industries/zed.git
+      ref: ${{ tasks.zed-commit.values.sha }}
+      path: zed
+      submodules: false
+
+  # Build dependencies from Zed's script/linux (apt branch, Ubuntu 24.04), minus the
+  # desktop-session packages that only matter for running the app.
+  - key: system-packages
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y --no-install-recommends \
+        gcc g++ build-essential make cmake clang lld llvm \
+        libasound2-dev libfontconfig-dev libgit2-dev libglib2.0-dev libssl-dev \
+        libva-dev libvulkan1 libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev \
+        libzstd-dev libsqlite3-dev libstdc++-14-dev musl-tools musl-dev \
+        elfutils gettext-base jq git curl
+      sudo apt-get clean
+
+  - key: rust
+    use: [system-packages, zed-src]
+    filter: [zed/rust-toolchain.toml]
+    run: |
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain none
+      . "$HOME/.cargo/env"
+      cd zed
+      rustup toolchain install   # reads rust-toolchain.toml
+      rustc --version
+
+  - key: patches
+    use: code
+    filter: [upstream/zed]
+    run: ls upstream/zed/*.patch
+    outputs:
+      artifacts:
+        - key: patches
+          path: upstream/zed
+
+  - key: build-base
+    use: [zed-src, rust]
+    runner: *big-runner
+    timeout: 90m
+    run: |
+      . "$HOME/.cargo/env"
+      cd zed
+      cargo test -p tabular_data_preview --locked --no-run
+
+  - key: test
+    use: build-base
+    runner: *big-runner
+    timeout: 60m
+    env:
+      PATCH_DIR: ${{ tasks.patches.artifacts.patches }}
+    run: |
+      set -euo pipefail
+      . "$HOME/.cargo/env"
+      cd zed
+      for patch in "$PATCH_DIR"/*.patch; do
+        echo "Applying $(basename "$patch")"
+        git apply --verbose "$patch"
+      done
+      # Zed's tests locate dev assets by walking up to a .git directory, which git/clone strips.
+      git init -q
+      cargo test -p tabular_data_preview --locked 2>&1 | tee ../test-output.txt
+    outputs:
+      artifacts:
+        - key: test-output
+          path: test-output.txt
+
+  # Zed's script/clippy lints in release mode, so it gets its own warm base build.
+  - key: clippy-base
+    use: [zed-src, rust]
+    runner: *big-runner
+    timeout: 90m
+    run: |
+      . "$HOME/.cargo/env"
+      cd zed
+      cargo clippy -p tabular_data_preview --locked --release --all-targets --all-features
+
+  - key: lint
+    use: clippy-base
+    runner: *big-runner
+    timeout: 60m
+    env:
+      PATCH_DIR: ${{ tasks.patches.artifacts.patches }}
+      # Skips script/clippy's optional local-only checks (cargo-shear, typos, buf).
+      GITHUB_ACTIONS: "true"
+    run: |
+      set -euo pipefail
+      . "$HOME/.cargo/env"
+      cd zed
+      for patch in "$PATCH_DIR"/*.patch; do git apply "$patch"; done
+      cargo fmt -p tabular_data_preview -- --check
+      ./script/clippy -p tabular_data_preview --locked
+
+  - key: release-base
+    use: [zed-src, rust]
+    runner: *release-runner
+    timeout: 180m
+    run: |
+      . "$HOME/.cargo/env"
+      cd zed
+      cargo build --release --locked -p zed
+      stat -c %s target/release/zed | tee "$RWX_VALUES/zed-bytes"
+      strip -o /tmp/zed-stripped target/release/zed
+      stat -c %s /tmp/zed-stripped | tee "$RWX_VALUES/zed-stripped-bytes"
+      cargo tree -p zed -e normal --prefix none --locked | sed 's/ (\*)$//' | sort -u \
+        > ../zed-crates.txt
+    outputs:
+      artifacts:
+        - key: zed-crates
+          path: zed-crates.txt
+
+  - key: release-patched
+    use: release-base
+    runner: *release-runner
+    timeout: 180m
+    env:
+      PATCH_DIR: ${{ tasks.patches.artifacts.patches }}
+    run: |
+      set -euo pipefail
+      . "$HOME/.cargo/env"
+      cd zed
+      for patch in "$PATCH_DIR"/*.patch; do git apply "$patch"; done
+      start=$(date +%s)
+      cargo build --release --locked -p zed --timings
+      echo $(( $(date +%s) - start )) | tee "$RWX_VALUES/incremental-seconds"
+      stat -c %s target/release/zed | tee "$RWX_VALUES/zed-bytes"
+      strip -o /tmp/zed-stripped target/release/zed
+      stat -c %s /tmp/zed-stripped | tee "$RWX_VALUES/zed-stripped-bytes"
+      cargo tree -p zed -e normal --prefix none --locked | sed 's/ (\*)$//' | sort -u \
+        > ../zed-crates.txt
+    outputs:
+      artifacts:
+        - key: zed-crates
+          path: zed-crates.txt
+        - key: cargo-timings
+          path: zed/target/cargo-timings
+
+  - key: report
+    use: system-packages
+    env:
+      BASE_SHA: ${{ tasks.zed-commit.values.sha }}
+      TEST_OUTPUT: ${{ tasks.test.artifacts.test-output }}
+      BASE_BYTES: ${{ tasks.release-base.values.zed-bytes }}
+      PATCHED_BYTES: ${{ tasks.release-patched.values.zed-bytes }}
+      BASE_STRIPPED: ${{ tasks.release-base.values.zed-stripped-bytes }}
+      PATCHED_STRIPPED: ${{ tasks.release-patched.values.zed-stripped-bytes }}
+      BASE_CRATES: ${{ tasks.release-base.artifacts.zed-crates }}
+      PATCHED_CRATES: ${{ tasks.release-patched.artifacts.zed-crates }}
+      INCREMENTAL_SECONDS: ${{ tasks.release-patched.values.incremental-seconds }}
+    run: |
+      set -euo pipefail
+      out=report.md
+      {
+        echo "# Parquet preview: build report"
+        echo
+        echo "- Zed base commit: \`$BASE_SHA\`"
+        echo "- Release binary (\`target/release/zed\`): $BASE_BYTES → $PATCHED_BYTES bytes (Δ $((PATCHED_BYTES - BASE_BYTES)))"
+        echo "- Stripped: $BASE_STRIPPED → $PATCHED_STRIPPED bytes (Δ $((PATCHED_STRIPPED - BASE_STRIPPED)))"
+        echo "- Incremental release rebuild after applying the patch: ${INCREMENTAL_SECONDS}s"
+        echo
+        echo "## Crates added to the \`zed\` dependency graph"
+        echo
+        echo '```'
+        comm -13 "$BASE_CRATES" "$PATCHED_CRATES"
+        echo '```'
+        echo
+        echo "## tabular_data_preview tests"
+        echo
+        echo '```'
+        grep -E '^test |^test result' "$TEST_OUTPUT"
+        echo '```'
+      } | tee "$out"
+    outputs:
+      artifacts:
+        - key: report
+          path: report.md
