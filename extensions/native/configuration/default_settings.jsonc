@@ -1,0 +1,6 @@
+{
+  // Default number of rows returned by read_rows (max 1000).
+  "max_rows": 50,
+  // Default maximum rows written by convert.
+  "convert_row_limit": 100000
+}

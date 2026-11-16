@@ -9,13 +9,29 @@ Zed extensions can't draw custom UI, and Zed won't open binary files such as `.p
 
 You don't need this extension for plain CSV viewing: open a `.csv`, `.tsv`, or `.jsonl` file and run `tabular data: open preview to the side` (Zed 1.17 or later).
 
+## Two extensions
+
+This repo holds two extensions that do the same job with different server runtimes. Install one, not both.
+
+| | [`extensions/node`](extensions/node) | [`extensions/native`](extensions/native) |
+|---|---|---|
+| Extension id | `parquet-viewer` | `parquet-viewer-native` |
+| Server | JavaScript, bundled and run on Zed's Node | Rust binary, downloaded from a GitHub release |
+| Formats | Parquet, CSV, TSV, JSONL | Parquet only |
+| Tools | `describe_table`, `read_rows`, `query`, `convert` | `describe_table`, `read_rows`, `convert` (no SQL yet) |
+| Release step | None, the server is embedded | Needs per-platform release builds (not set up yet) |
+
+The rest of this README describes the Node extension. The native one has the same tools minus `query`, and uses the same settings.
+
 ## Install (dev)
 
 1. Clone this repo.
-2. In Zed, run `zed: install dev extension` and pick the repo folder.
+2. In Zed, run `zed: install dev extension` and pick `extensions/node` (or `extensions/native`).
 3. In the Agent panel's settings, make sure the **parquet-viewer** server is enabled.
 
-You need Rust installed through rustup, because Zed compiles the extension to `wasm32-wasip2`. The server runs on the Node.js runtime that ships with Zed, so you don't need to install Node.
+You need Rust installed through rustup, because Zed compiles the extension to `wasm32-wasip2`. The Node server runs on the Node.js runtime that ships with Zed, so you don't need to install Node.
+
+The native extension downloads `parquet-viewer-mcp-<os>-<arch>.tar.gz` (`.zip` on Windows) from this repo's latest GitHub release. Nothing publishes those yet, so until the release workflow exists the native extension can't start outside a local build of the server.
 
 ## Tools
 
@@ -52,16 +68,17 @@ Parquet files are read one row group at a time, so large files aren't loaded ful
 
 ## Development
 
-The MCP server lives in `server/`. It's bundled into `server/dist/server.js`, which is committed because Zed builds extensions with Cargo only. The bundle is embedded into the WASM extension with `include_str!` and written to the extension's work directory when the server starts.
+The Node MCP server lives in `extensions/node/server/`. It's bundled into `extensions/node/server/dist/server.js`, which is committed because Zed builds extensions with Cargo only. The bundle is embedded into the WASM extension with `include_str!` and written to the extension's work directory when the server starts.
 
 ```sh
-cd server
+cd extensions/node/server
 npm ci
 npm test            # unit tests + MCP stdio smoke test against dist/server.js
 npm run build       # rebuild dist/server.js after changing src/
 
-cd ..
-cargo build --release --target wasm32-wasip2
+cd ../../..
+cargo build --release --target wasm32-wasip2 -p zed-parquet-viewer -p zed-parquet-viewer-native
+cargo test -p parquet-viewer-mcp     # native server (extensions/native/server)
 ```
 
 CI checks that `dist/server.js` matches the sources.

@@ -1,0 +1,9 @@
+id = "parquet-viewer-native"
+name = "Parquet Viewer (Native)"
+version = "0.1.0"
+schema_version = 1
+authors = ["Elvis Kahoro <elvis@elvis.ai>"]
+description = "Inspect and convert Parquet files from Zed's agent using a native Rust MCP server, then view them in the built-in table preview."
+repository = "https://github.com/elviskahoro/zed-csv"
+
+[context_servers.parquet-viewer-native]

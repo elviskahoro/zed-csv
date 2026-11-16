@@ -1,13 +1,8 @@
-[package]
-name = "zed-parquet-viewer"
-version = "0.1.0"
-edition = "2024"
-publish = false
-license = "Apache-2.0"
-
-[lib]
-path = "src/lib.rs"
-crate-type = ["cdylib"]
-
-[dependencies]
-zed_extension_api = "0.7.0"
+[workspace]
+resolver = "3"
+members = [
+  "extensions/node",
+  "extensions/native",
+  "extensions/native/server",
+]
+default-members = ["extensions/native/server"]
